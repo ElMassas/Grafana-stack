@@ -1,0 +1,231 @@
+version: "2.1"
+
+networks:
+  stack-net:
+    driver: bridge
+
+volumes:
+  prometheus_data: {}
+  grafana_data: {}
+
+services:
+  ####
+  #metrics
+  ####
+  prometheus:
+    image: prom/prometheus:main
+    container_name: prometheus
+    volumes:
+      - ./prometheus/:/etc/prometheus/
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+      - "--web.enable-lifecycle"
+      - "--query.lookback-delta=90m"
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    networks:
+      - stack-net
+    labels:
+      org.label-schema.group: "monitoring"
+
+  nodeexporter:
+    image: quay.io/prometheus/node-exporter:master
+    container_name: nodeexporter
+    hostname: This-Machine
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.rootfs=/rootfs"
+      - "--path.sysfs=/host/sys"
+      - "--collector.filesystem.ignored-mount-points=^/(sys|proc|dev|host|etc)($$|/)"
+    restart: unless-stopped
+    networks:
+      - stack-net
+    labels:
+      org.label-schema.group: "monitoring"
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.38.6
+    container_name: cadvisor
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      #- /cgroup:/cgroup:ro #doesn't work on MacOS only for Linux
+    restart: unless-stopped
+    networks:
+      - stack-net
+    labels:
+      org.label-schema.group: "monitoring"
+
+  ####
+  #Cool metrics additions
+  ####
+  pushgateway:
+    image: quay.io/prometheus/pushgateway:v0.10.0
+    container_name: pushgateway
+    restart: unless-stopped
+    networks:
+      - stack-net
+    labels:
+      org.label-schema.group: "monitoring"
+
+  blackbox:
+    image: quay.io/prometheus/blackbox-exporter:v0.18.0
+    container_name: blackbox
+    volumes:
+      - ./blackbox/:/etc/blackboxexporter/
+    command:
+      - "--config.file=etc/blackboxexporter/config.yml"
+    dns: 1.1.1.1
+    restart: unless-stopped
+    networks:
+      - stack-net
+    labels:
+      org.label-schema.group: "monitoring"
+
+  ####
+  #visualization
+  ####
+  grafana:
+    image: grafana/grafana:main
+    container_name: grafana
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources/
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards/
+      - ./grafana/setup.sh:/setup.sh
+    environment:
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+      - tempo-query
+      - loki
+    ports:
+      - "3000:3000"
+    networks:
+      - stack-net
+    labels:
+      org.label-schema.group: "visualization"
+
+  ####
+  #tracing
+  ####
+  tempo:
+    image: grafana/tempo:0.7.0
+    container_name: tempo
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./etc/tempo-local.yaml:/etc/tempo.yaml
+      - ./data/tempo-data:/tmp/tempo
+    ports:
+      - "14268" # jaeger ingest, Jaeger - Thrift HTTP
+      - "14250" # Jaeger - GRPC
+      - "55680" # OpenTelemetry
+      - "3100" # tempo
+      - "6831/udp" # Jaeger - Thrift Compact
+      - "6832/udp" # Jaeger - Thrift Binary
+    networks:
+      - stack-net
+    labels:
+      org.label-schema.group: "tracing"
+
+  tempo-query:
+    image: grafana/tempo-query:0.7.0
+    container_name: tempo-query
+    command: ["--grpc-storage-plugin.configuration-file=/etc/tempo-query.yaml"]
+    volumes:
+      - ./etc/tempo-query.yaml:/etc/tempo-query.yaml
+    ports:
+      - "16686:16686" # jaeger-ui
+    depends_on:
+      - tempo
+    networks:
+      - stack-net
+    labels:
+      org.label-schema.group: "tracing"
+
+  ####
+  #logging
+  ####
+  promtail:
+    image: grafana/promtail:2.2.0
+    container_name: promtail
+    command: -config.file=/etc/promtail/promtail-local.yaml
+    volumes:
+      - ./etc/promtail-local.yaml:/etc/promtail/promtail-local.yaml
+      - ./data/logs:/app/logs
+    depends_on:
+      - loki
+    networks:
+      - stack-net
+    labels:
+      org.label-schema.group: "logging"
+
+  loki:
+    image: grafana/loki:2.2.0
+    container_name: loki
+    command: -config.file=/etc/loki/loki-local.yaml
+    ports:
+      - "3101:3100" # loki needs to be exposed so it receives logs
+    environment:
+      - JAEGER_AGENT_HOST=tempo
+      - JAEGER_ENDPOINT=http://tempo:14268/api/traces # send traces to Tempo
+      - JAEGER_SAMPLER_TYPE=const
+      - JAEGER_SAMPLER_PARAM=1
+    volumes:
+      - ./etc/loki-local.yaml:/etc/loki/loki-local.yaml
+      - ./data/loki-data:/tmp/loki
+    networks:
+      - stack-net
+    labels:
+      org.label-schema.group: "logging"
+
+  ####
+  #alerting
+  ####
+  alertmanager:
+    image: quay.io/prometheus/alertmanager:v0.21.0
+    container_name: alertmanager
+    volumes:
+      - ./alertmanager/:/etc/alertmanager/
+    command:
+      - "--config.file=/etc/alertmanager/config.yml"
+      - "--storage.path=/alertmanager"
+    restart: unless-stopped
+    networks:
+      - stack-net
+    labels:
+      org.label-schema.group: "alerting"
+
+  karma:
+    image: lmierzwa/karma:v0.77
+    container_name: karma
+    environment:
+      - ALERTMANAGER_URI=http://alertmanager:9093
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    networks:
+      - stack-net
+    labels:
+      org.label-schema.group: "alerting"
+
+  ####
+  #oncall
+  ####
+  #https://hub.docker.com/r/grafana/oncall
