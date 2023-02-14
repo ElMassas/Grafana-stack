@@ -1,0 +1,340 @@
+version: "3.8"
+
+services:
+  ####
+  #metrics
+  ####
+  prometheus:
+    image: prom/prometheus:v2.41.0
+    container_name: prometheus
+    volumes:
+      - ./configs/prometheus/:/etc/prometheus/
+      - prometheus:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+      - "--storage.tsdb.retention.time=12h"
+      - "--web.enable-lifecycle"
+      - "--log.level=info"
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    networks:
+      - stack
+    labels:
+      org.label-schema.group: "monitoring"
+      org.label-schema.logging_agent: "promtail"
+      org.label-schema.logging_jobname: "container_logs"
+
+  nodeexporter:
+    image: prom/node-exporter:v1.5.0
+    container_name: nodeexporter
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.rootfs=/rootfs"
+      - "--path.sysfs=/host/sys"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+    restart: unless-stopped
+    ports:
+      - "9100:9100"
+    networks:
+      - stack
+    labels:
+      org.label-schema.group: "monitoring"
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.46.0
+    container_name: cadvisor
+    privileged: true
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /cgroup:/cgroup:ro #only for linux
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    networks:
+      - stack
+    labels:
+      org.label-schema.group: "monitoring"
+
+  ####
+  #Metrics additions
+  ####
+  pushgateway:
+    image: prom/pushgateway:v1.5.1
+    container_name: pushgateway
+    restart: unless-stopped
+    ports:
+      - "9091:9091"
+    networks:
+      - stack
+    labels:
+      org.label-schema.group: "monitoring"
+
+  ####
+  #visualization
+  ####
+  grafana:
+    image: grafana/grafana:9.3.2
+    container_name: grafana
+    volumes:
+      - grafana:/var/lib/grafana
+      - ./configs/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
+      - ./configs/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+      #- GF_SECURITY_ADMIN_USER=${ADMIN_USER:-admin}
+      #- GF_SECURITY_ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin}
+      #- GF_USERS_ALLOW_SIGN_UP=false
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - stack
+    labels:
+      org.label-schema.group: "visualization"
+      org.label-schema.logging_agent: "promtail"
+      org.label-schema.logging_jobname: "container_logs"
+
+  ####
+  #logging
+  ####
+  init:
+    image: grafana/loki:2.7.3
+    user: root
+    entrypoint:
+      - "chown"
+      - "10001:10001"
+      - "/loki"
+    volumes:
+      - ./loki:/loki
+    networks:
+      - stack
+    labels:
+      org.label-schema.group: "logging"
+
+  loki-read:
+    image: grafana/loki:2.7.3
+    # can't have a specific docker name due to replication
+    volumes:
+      - ./configs/loki:/etc/loki/
+    ports:
+      - "3100"
+      - "7946"
+      # uncomment to use interactive debugging
+      # - "40000-40001:40000" # # makes the replicas available on ports 40000, 40001
+      #cap_add:
+      #  - SYS_PTRACE
+      #security_opt:
+      #  - apparmor=unconfined
+    command: "-config.file=/etc/loki/loki.yaml -target=read"
+    restart: always
+    deploy:
+      mode: replicated
+      replicas: 3
+    networks:
+      - stack
+    labels:
+      org.label-schema.group: "logging"
+
+  loki-write:
+    image: grafana/loki:2.7.3
+    # can't have a specific docker name due to replication
+    volumes:
+      - ./configs/loki:/etc/loki/
+    ports:
+      - "3100"
+      - "7946"
+      # uncomment to use interactive debugging
+      # - "50000-50001:40000" # makes the replicas available on ports 50000, 50001
+      # cap_add:
+      #   - SYS_PTRACE
+      # security_opt:
+      #   - apparmor=unconfined
+    command: "-config.file=/etc/loki/loki.yaml -target=write"
+    restart: always
+    deploy:
+      mode: replicated
+      replicas: 3
+    networks:
+      - stack
+    labels:
+      org.label-schema.group: "logging"
+
+  promtail:
+    image: grafana/promtail:2.7.3
+    container_name: promtail
+    command: -config.file=/etc/promtail/promtail.yaml
+    volumes:
+      - ./configs/promtail:/etc/promtail/
+      - ./loki/:/var/log/
+    ports:
+      - "9080:9080"
+    networks:
+      - stack
+    labels:
+      org.label-schema.group: "logging"
+
+  #random log generator
+  flog:
+    image: mingrammer/flog
+    command:
+      - --loop
+      - --format=json
+      - --number=10 # number of log lines to generate per second
+      - --delay=100ms # delay between log lines
+      - --output=/var/log/generated-logs.txt
+      - --overwrite
+      - --type=log
+    volumes:
+      - ./loki/:/var/log/ #store logs here so that promtail can fetch them
+    networks:
+      - stack
+    labels:
+      org.label-schema.group: "logging"
+      org.label-schema.logging_agent: "promtail"
+      org.label-schema.logging_jobname: "container_logs"
+
+  ####
+  #alerting
+  ####
+  alertmanager:
+    image: prom/alertmanager:v0.25.0
+    container_name: alertmanager
+    volumes:
+      - ./configs/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml
+      - alertmanager-data:/data
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    restart: unless-stopped
+    ports:
+      - "9093:9093"
+    networks:
+      - stack
+    labels:
+      org.label-schema.group: "alerting"
+      org.label-schema.logging_agent: "promtail"
+      org.label-schema.logging_jobname: "container_logs"
+
+  ####
+  #oncall
+  ####
+  #https://hub.docker.com/r/grafana/oncall
+
+  ####
+  # Gateway
+  ####
+  loki-gateway:
+    image: nginx:1.19
+    container_name: gateway
+    volumes:
+      - ./configs/nginx/nginx.conf:/etc/nginx/nginx.conf
+    ports:
+      - "8080:80"
+      - "3100"
+    networks:
+      - stack
+    labels:
+      org.label-schema.group: "gateway"
+      org.label-schema.logging_agent: "promtail"
+      org.label-schema.logging_jobname: "container_logs"
+
+  ####
+  # Storage
+  ####
+  minio:
+    image: minio/minio
+    container_name: s3
+    entrypoint:
+      - sh
+      - -euc
+      - |
+        mkdir -p /data/loki-data && \
+        mkdir -p /data/loki-ruler && \
+        minio server /data
+    environment:
+      - MINIO_ACCESS_KEY=loki
+      - MINIO_SECRET_KEY=supersecret
+      - MINIO_PROMETHEUS_AUTH_TYPE=public
+      - MINIO_UPDATE=off
+    ports:
+      - "9000:9000"
+    volumes:
+      - ./.data/minio:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 20s
+      retries: 5
+    networks:
+      - stack
+    labels:
+      org.label-schema.group: "storage"
+
+  ####
+  #tracing
+  ####
+  #tempo:
+  #  image: grafana/tempo:0.7.0
+  #  container_name: tempo
+  #  command: ["-config.file=/etc/tempo.yaml"]
+  #  volumes:
+  #    - ./etc/tempo-local.yaml:/etc/tempo.yaml
+  #    - ./data/tempo-data:/tmp/tempo
+  #  ports:
+  #    - "14268" # jaeger ingest, Jaeger - Thrift HTTP
+  #    - "14250" # Jaeger - GRPC
+  #    - "55680" # OpenTelemetry
+  #    - "3100" # tempo
+  #    - "6831/udp" # Jaeger - Thrift Compact
+  #    - "6832/udp" # Jaeger - Thrift Binary
+  #  networks:
+  #    - stack
+  #  labels:
+  #    org.label-schema.group: "tracing"
+  #
+  #tempo-query:
+  #  image: grafana/tempo-query:0.7.0
+  #  container_name: tempo-query
+  #  command: ["--grpc-storage-plugin.configuration-file=/etc/tempo-query.yaml"]
+  #  volumes:
+  #    - ./etc/tempo-query.yaml:/etc/tempo-query.yaml
+  #  ports:
+  #    - "16686:16686" # jaeger-ui
+  #  depends_on:
+  #    - tempo
+  #  networks:
+  #    - stack
+  #  labels:
+  #    org.label-schema.group: "tracing"
+
+networks:
+  stack:
+
+volumes:
+  prometheus:
+  grafana:
+  alertmanager-data:
