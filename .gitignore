@@ -1,0 +1,7 @@
+/etc
+./.data
+./loki
+*DS_Store
+.vs/
+.vscode/
+.idea/
