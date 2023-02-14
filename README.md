@@ -113,3 +113,4 @@ Following this [label schema](http://label-schema.org/rc1/)
 3. Add tempo for tracing
 4. Update diagram for docker-compose
 5. Add example for deploying in Kubernetes
+6. Add blackbox exporter and caddy server
